@@ -9,7 +9,7 @@ use futures::future::{self, BoxFuture};
 use futures::stream::{self, select_all, BoxStream, FuturesUnordered};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use indicatif::{ProgressState, ProgressStyle};
-use nixapi::{check_cache_status, CacheStatus, Derivation, DrvPath, StorePath};
+use nixapi::{check_cache_status, CacheStatus, Derivation, DrvPath, OutputName, StorePath};
 use petgraph::algo::toposort;
 use petgraph::visit::{EdgeRef as _, IntoNodeReferences};
 use petgraph::Direction::{Incoming, Outgoing};
@@ -267,9 +267,9 @@ fn build_drvs<'a>(
                     (drv_dependants_recursive[drv_path].len(), drv_path.clone())
                 });
                 let to_build = buildable_drvs.last().cloned().unwrap();
-                info!(drv = %to_build.0, "Building");
+                info!(drv = %to_build.as_str(), "Building");
                 let out_path = out_dir.map(|dir| {
-                    let drv_name = Path::new(&to_build.0).file_stem().unwrap();
+                    let drv_name = to_build.file_stem().unwrap();
                     dir.join(drv_name)
                 });
 
@@ -305,7 +305,7 @@ fn build_drvs<'a>(
             }
             match result {
                 Ok(_) => {
-                    info!(drv = %completed_drv_path.0, "Build succeeded");
+                    info!(drv = %completed_drv_path.as_str(), "Build succeeded");
                     for dependencies in drv_dependencies.values_mut() {
                         dependencies.remove(&completed_drv_path);
                     }
@@ -314,7 +314,7 @@ fn build_drvs<'a>(
                     success_count += 1;
                 }
                 Err(_) => {
-                    warn!(drv = %completed_drv_path.0, "Build failed");
+                    warn!(drv = %completed_drv_path.as_str(), "Build failed");
                     for dependant in drv_dependants_recursive[&completed_drv_path].iter() {
                         remaining_drv_paths.remove(dependant);
                     }
@@ -335,7 +335,7 @@ async fn build_drv(drv_path: &DrvPath, out_path: Option<&Path>) -> Result<()> {
     } else {
         cmd.arg("--no-out-link");
     }
-    cmd.arg(&drv_path.0);
+    cmd.arg(drv_path.as_str());
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
@@ -366,7 +366,7 @@ async fn build_drv(drv_path: &DrvPath, out_path: Option<&Path>) -> Result<()> {
     }
     let status = child.wait().await?;
     if !status.success() {
-        bail!("Failed to build '{}'", drv_path.0);
+        bail!("Failed to build '{}'", drv_path.as_str());
     }
     Ok(())
 }
@@ -406,20 +406,9 @@ impl CacheStatusChecker {
             .await
     }
 
-    async fn check_drv(self: Arc<Self>, drv: &Derivation) -> CacheStatus {
-        let paths = drv.outputs.values().collect::<Vec<_>>();
-        stream::iter(paths.into_iter().cloned())
-            .map(|path| {
-                let self_clone = self.clone();
-                tokio::spawn(async move { self_clone.check_path(&path).await })
-            })
-            .buffer_unordered(drv.outputs.len())
-            .then(|result| future::ready(result.unwrap()))
-            .collect::<Vec<_>>()
+    async fn check_drv(&self, drv: &Derivation) -> CacheStatus {
+        self.check_path(&drv.outputs[&OutputName("out".to_string())])
             .await
-            .into_iter()
-            .min()
-            .unwrap()
     }
 
     async fn check_drvs(self: Arc<Self>, drvs: &[Derivation]) -> HashMap<DrvPath, CacheStatus> {
@@ -487,7 +476,7 @@ impl CacheUploader {
             return Ok(());
         }
         let _permit = self.limiter.acquire().await;
-        info!(path = %path.0, "Uploading");
+        info!(path = %path.as_str(), "Uploading");
         let header_span = info_span!("header");
         let path_clone = path.clone();
         header_span.pb_set_style(
@@ -507,7 +496,7 @@ impl CacheUploader {
             .kill_on_drop(true)
             .arg("-c")
             .arg(&self.upload_command)
-            .env("UPLOAD_STORE_PATH", &path.0)
+            .env("UPLOAD_STORE_PATH", path.as_str())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
@@ -531,7 +520,7 @@ impl CacheUploader {
             }
         }
         self.cache_checker.mark_cached(path);
-        info!(path = %path.0, "Upload succeeded");
+        info!(path = %path.as_str(), "Upload succeeded");
         Ok(())
     }
 
@@ -545,7 +534,9 @@ impl CacheUploader {
             }
         }
         for output in drv.outputs.values() {
-            self.upload_path(output).await?;
+            if output.as_ref().exists() {
+                self.upload_path(output).await?;
+            }
         }
         Ok(())
     }

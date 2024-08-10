@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    ops::Deref,
     path::Path,
 };
 
@@ -24,6 +25,23 @@ impl StorePath {
     pub fn get_name(&self) -> &str {
         &self.0.rsplit_once('/').unwrap().1[33..]
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Deref for StorePath {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        self.0.as_ref()
+    }
+}
+
+impl AsRef<Path> for StorePath {
+    fn as_ref(&self) -> &Path {
+        self.0.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -34,6 +52,23 @@ impl DrvPath {
     pub fn get_name(&self) -> &str {
         let filename = self.0.rsplit_once('/').unwrap().1;
         &filename[33..filename.len() - 4]
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Deref for DrvPath {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        self.0.as_ref()
+    }
+}
+
+impl AsRef<Path> for DrvPath {
+    fn as_ref(&self) -> &Path {
+        self.0.as_ref()
     }
 }
 
@@ -66,7 +101,7 @@ pub async fn check_cache_status(
             }
         }
     }
-    if Path::new(&path.0).exists() {
+    if path.exists() {
         return CacheStatus::Local;
     }
     CacheStatus::NotBuilt
@@ -77,7 +112,7 @@ pub async fn query_requisites(path: &StorePath) -> Result<Vec<StorePath>> {
         .kill_on_drop(true)
         .arg("--query")
         .arg("--requisites")
-        .arg(&path.0)
+        .arg(path.as_str())
         .output()
         .await?;
     ensure!(
@@ -103,7 +138,7 @@ pub struct Derivation {
 
 impl Derivation {
     pub fn parse(drv_path: DrvPath) -> Result<Self> {
-        let content = std::fs::read_to_string(&drv_path.0)?;
+        let content = std::fs::read_to_string(&drv_path)?;
         let (_, res) = parse_derivation(&content).map_err(|e| {
             anyhow::anyhow!(
                 "failed to parse derivation file {drv_path:?}: {error}",
