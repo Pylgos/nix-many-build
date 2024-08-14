@@ -67,23 +67,26 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let mut drvs = BTreeMap::new();
-    let leaf_drvs = evaluate(&args.attr, &args.gc_roots_dir).await?;
+    let drv_by_attr = evaluate(&args.attr, &args.gc_roots_dir).await?;
     if let Some(up_to) = &args.up_to {
-        let (up_to_drv_path, _) = leaf_drvs
-            .iter()
-            .find(|(_drv_path, drv)| drv.attr.as_ref() == Some(up_to))
-            .with_context(|| {
-                format!(
-                    "No derivation with attribute '{}' found in flake '{}'",
-                    up_to, args.attr
-                )
-            })?;
-        collect_drv_closure(&mut drvs, &leaf_drvs[up_to_drv_path]).await?;
+        let up_to_drv = drv_by_attr.get(up_to).with_context(|| {
+            format!(
+                "No derivation with attribute '{}' found in flake '{}'",
+                up_to, args.attr
+            )
+        })?;
+        collect_drv_closure(&mut drvs, up_to_drv).await?;
     } else {
-        for drv in leaf_drvs.values() {
+        for drv in drv_by_attr.values() {
             collect_drv_closure(&mut drvs, drv).await?;
         }
     }
+    let attr_by_drv = drv_by_attr
+        .iter()
+        .map(|(attr, drv)| (drv.path.clone(), attr.clone()))
+        .collect::<HashMap<_, _>>();
+    let attr_by_drv = Arc::new(attr_by_drv);
+
     let drvs = Arc::new(drvs);
 
     let substituters = [Url::parse("https://cache.nixos.org")?];
@@ -156,9 +159,10 @@ async fn main() -> Result<()> {
     select_all([built_drvs_stream, local_drvs_stream])
         .map_ok(move |drv| {
             let cache_uploader = cache_uploader_clone.clone();
+            let attr_by_drv = attr_by_drv.clone();
             tokio::spawn(async move {
                 if let Some(cache_uploader) = &cache_uploader {
-                    if drv.attr.is_some() {
+                    if attr_by_drv.contains_key(&drv.path) {
                         cache_uploader.upload_drv_outputs(&drv, true).await?;
                     }
                 }
@@ -610,7 +614,7 @@ async fn collect_drv_closure(
     Ok(())
 }
 
-async fn evaluate(attr: &str, gc_roots_dir: &Path) -> Result<BTreeMap<DrvPath, Derivation>> {
+async fn evaluate(attr: &str, gc_roots_dir: &Path) -> Result<BTreeMap<String, Derivation>> {
     info!(attr = %attr, "Evaluating flake");
     let header_span = info_span!("header");
     header_span.pb_set_style(&ProgressStyle::default_spinner());
@@ -646,9 +650,8 @@ async fn evaluate(attr: &str, gc_roots_dir: &Path) -> Result<BTreeMap<DrvPath, D
         if let Some(error) = parsed.error {
             warn!(attr = %parsed.attr, error = %error, "evaluation failed");
         } else {
-            let mut drv = Derivation::parse(parsed.drv_path.clone().unwrap())?;
-            drv.attr = Some(parsed.attr);
-            results.insert(parsed.drv_path.clone().unwrap(), drv);
+            let drv = Derivation::parse(parsed.drv_path.clone().unwrap())?;
+            results.insert(parsed.attr, drv);
         }
     }
 
