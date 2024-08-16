@@ -106,26 +106,6 @@ pub async fn check_cache_status(
     CacheStatus::NotBuilt
 }
 
-// pub async fn query_requisites(path: &StorePath) -> Result<Vec<StorePath>> {
-//     let output = Command::new("nix-store")
-//         .kill_on_drop(true)
-//         .arg("--query")
-//         .arg("--requisites")
-//         .arg(path.as_str())
-//         .output()
-//         .await?;
-//     ensure!(
-//         output.status.success(),
-//         "failed to query requisites of {}",
-//         path.0
-//     );
-//     let stdout = String::from_utf8(output.stdout)?;
-//     Ok(stdout
-//         .lines()
-//         .map(|line| StorePath(line.to_string()))
-//         .collect())
-// }
-
 #[derive(Debug, Clone)]
 pub struct Derivation {
     pub path: DrvPath,

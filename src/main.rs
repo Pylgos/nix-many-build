@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use futures::future::{self, BoxFuture};
 use futures::stream::{self, select_all, BoxStream, FuturesUnordered};
@@ -21,7 +21,7 @@ use tokio::process::Command;
 use tokio::select;
 use tokio::sync::{OnceCell, Semaphore};
 use tracing::level_filters::LevelFilter;
-use tracing::{info, info_span, warn, Level};
+use tracing::{error, info, info_span, warn, Level};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -47,6 +47,8 @@ struct Args {
     upload_command: Option<String>,
     #[arg(long, short, default_values = &["https://cache.nixos.org"])]
     substituters: Vec<Url>,
+    #[arg(long, default_value_t = false)]
+    keep_going: bool,
 }
 
 fn init_logging() {
@@ -136,27 +138,41 @@ async fn main() -> Result<()> {
         args.out_dir.as_deref(),
         args.max_jobs,
         args.max_fetch_jobs,
+        args.keep_going,
     );
 
+    let build_statuses = Arc::new(Mutex::new(HashMap::new()));
+    let build_statuses_clone = build_statuses.clone();
     let drvs_clone = drvs.clone();
     let cache_checker_clone = cache_checker.clone();
     let built_drvs_stream = build_stream
-        .map(move |(drv_path, status)| match status {
-            BuildStatus::Success => {
-                let drv = drvs_clone.get(&drv_path).unwrap().clone();
-                for output in drv.outputs.values() {
-                    cache_checker_clone.mark_local(output);
+        .filter_map(move |(drv_path, status)| {
+            build_statuses_clone
+                .lock()
+                .unwrap()
+                .insert(drv_path.clone(), status);
+            match status {
+                BuildStatus::Success => {
+                    let drv = drvs_clone.get(&drv_path).unwrap().clone();
+                    for output in drv.outputs.values() {
+                        cache_checker_clone.mark_local(output);
+                    }
+                    future::ready(Some(anyhow::Ok(drv)))
                 }
-                anyhow::Ok(drv)
-            }
-            BuildStatus::Failure => {
-                bail!("Build failed");
+                BuildStatus::Failure => {
+                    if args.keep_going {
+                        future::ready(None)
+                    } else {
+                        error!("Aborting due to build error");
+                        future::ready(Some(Err(anyhow!("Failed to build {}", drv_path.as_str()))))
+                    }
+                }
             }
         })
         .boxed();
 
     let cache_uploader_clone = cache_uploader.clone();
-    select_all([built_drvs_stream, local_drvs_stream])
+    let result = select_all([built_drvs_stream, local_drvs_stream])
         .map_ok(move |drv| {
             let cache_uploader = cache_uploader_clone.clone();
             let attr_by_drv = attr_by_drv.clone();
@@ -168,27 +184,36 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             })
-            .then(|result| future::ready(result.unwrap()))
+            .map(|result| result.unwrap())
         })
         .try_buffer_unordered(16)
-        .for_each(|_| async {})
+        .try_for_each(|_| future::ok(()))
         .await;
 
-    // let components = connected_components(&graph);
-    // let subgraphs = create_subgraphs(&graph, &components);
-    // println!("To build: {}", graph.node_count());
-    // println!("Subgraphs: {}", subgraphs.len());
-    // fs::create_dir_all("subgraphs")?;
-    // for (i, subgraph) in subgraphs.iter().enumerate() {
-    //     println!("  {i}: node_count = {}", subgraph.node_count());
-    //     let mut dot_file = fs::File::create(format!("subgraphs/{i}.dot"))?;
-    //     let content = format!("{:?}", Dot::new(&subgraph));
-    //     dot_file.write_all(content.as_bytes())?;
-    // }
-
-    Ok(())
+    let statuses = build_statuses.lock().unwrap();
+    let total = to_build.len();
+    let built_count = statuses
+        .values()
+        .filter(|s| **s == BuildStatus::Success)
+        .count();
+    let failed_count = statuses
+        .values()
+        .filter(|s| **s == BuildStatus::Failure)
+        .count();
+    let canceled_count = to_build.len() - built_count - failed_count;
+    match result {
+        Ok(_) => {
+            info!(total = %total, built = %built_count, failed = %failed_count, canceled = %canceled_count, "Done");
+            Ok(())
+        }
+        Err(e) => {
+            error!(total = %total, built = %built_count, failed = %failed_count, canceled = %canceled_count, "Failed to build some derivations");
+            Err(e)
+        }
+    }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuildStatus {
     Success,
     Failure,
@@ -200,6 +225,7 @@ fn build_drvs<'a>(
     out_dir: Option<&'a Path>,
     max_jobs: usize,
     max_fetch_jobs: usize,
+    keep_going: bool,
 ) -> BoxStream<'a, (DrvPath, BuildStatus)> {
     async_stream::stream! {
         let mut drv_dependencies: HashMap<&DrvPath, HashSet<&DrvPath>> = graph
@@ -280,7 +306,7 @@ fn build_drvs<'a>(
                 let to_build_clone = to_build.clone();
                 let task =
                     tokio::spawn(async move { build_drv(&to_build_clone, out_path.as_deref()).await })
-                        .then(|result| future::ready(result.unwrap()))
+                        .map(|result| result.unwrap())
                         .boxed();
                 remaining_drv_paths.remove(&to_build);
 
@@ -309,7 +335,7 @@ fn build_drvs<'a>(
             }
             match result {
                 Ok(_) => {
-                    info!(drv = %completed_drv_path.as_str(), "Build succeeded");
+                    info!(name = %completed_drv_path.get_name(), drv = %completed_drv_path.as_str(), "Build succeeded");
                     for dependencies in drv_dependencies.values_mut() {
                         dependencies.remove(&completed_drv_path);
                     }
@@ -318,7 +344,13 @@ fn build_drvs<'a>(
                     success_count += 1;
                 }
                 Err(_) => {
-                    warn!(drv = %completed_drv_path.as_str(), "Build failed");
+                    if keep_going {
+                        warn!(name = %completed_drv_path.get_name(), drv = %completed_drv_path.as_str(), "Build failed");
+                    } else {
+                        error!(name = %completed_drv_path.get_name(), drv = %completed_drv_path.as_str(), "Build failed");
+                        yield (completed_drv_path, BuildStatus::Failure);
+                        return;
+                    }
                     for dependant in drv_dependants_recursive[&completed_drv_path].iter() {
                         remaining_drv_paths.remove(dependant);
                     }
@@ -545,55 +577,6 @@ impl CacheUploader {
         Ok(())
     }
 }
-
-// fn create_subgraphs(
-//     g: &Graph<DrvPath, ()>,
-//     components: &[Vec<NodeIndex>],
-// ) -> Vec<Graph<DrvPath, ()>> {
-//     let mut subgraphs = Vec::new();
-//     for component in components {
-//         let mut subgraph = Graph::new();
-//         let mut node_map = HashMap::new();
-//         for node in component {
-//             let new_node = subgraph.add_node(g[*node].clone());
-//             node_map.insert(*node, new_node);
-//         }
-//         for edge in g.edge_references() {
-//             if let (Some(source), Some(target)) =
-//                 (node_map.get(&edge.source()), node_map.get(&edge.target()))
-//             {
-//                 subgraph.add_edge(*source, *target, ());
-//             }
-//         }
-//         subgraphs.push(subgraph);
-//     }
-//     subgraphs
-// }
-//
-// fn connected_components<G>(g: G) -> Vec<Vec<G::NodeId>>
-// where
-//     G: NodeCompactIndexable + IntoEdgeReferences,
-// {
-//     let mut vertex_sets = UnionFind::new(g.node_bound());
-//     for edge in g.edge_references() {
-//         let (a, b) = (edge.source(), edge.target());
-//
-//         // union the two vertices of the edge
-//         vertex_sets.union(g.to_index(a), g.to_index(b));
-//     }
-//     let labels = vertex_sets.into_labeling();
-//     let mut label_set = BTreeMap::new();
-//     for label in labels.iter().copied() {
-//         let len = label_set.len();
-//         label_set.entry(label).or_insert(len);
-//     }
-//     let mut components = vec![Vec::new(); label_set.len()];
-//     for (node_index, label) in labels.iter().enumerate() {
-//         let node = g.from_index(node_index);
-//         components[label_set[label]].push(node);
-//     }
-//     components
-// }
 
 #[async_recursion::async_recursion]
 async fn collect_drv_closure(

@@ -42,6 +42,7 @@
           '';
           doCheck = false;
         };
+        test = import ./test/test.nix { inherit pkgs; };
       }
     );
 }
