@@ -42,7 +42,7 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     max_jobs: usize,
     #[arg(long, default_value_t = 16)]
-    max_fetch_jobs: usize,
+    max_local_jobs: usize,
     #[arg(long)]
     upload_command: Option<String>,
     #[arg(long, short, default_values = &["https://cache.nixos.org"])]
@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
         &drvs,
         args.out_dir.as_deref(),
         args.max_jobs,
-        args.max_fetch_jobs,
+        args.max_local_jobs,
         args.keep_going,
     );
 
@@ -224,7 +224,7 @@ fn build_drvs<'a>(
     drvs: &'a BTreeMap<DrvPath, Derivation>,
     out_dir: Option<&'a Path>,
     max_jobs: usize,
-    max_fetch_jobs: usize,
+    max_local_jobs: usize,
     keep_going: bool,
 ) -> BoxStream<'a, (DrvPath, BuildStatus)> {
     async_stream::stream! {
@@ -267,25 +267,25 @@ fn build_drvs<'a>(
         header_span.pb_start();
 
         let mut builds_in_progress: HashMap<DrvPath, BoxFuture<Result<()>>> = HashMap::new();
-        let mut fetches_in_progress: HashMap<DrvPath, BoxFuture<Result<()>>> = HashMap::new();
+        let mut local_builds_in_progress: HashMap<DrvPath, BoxFuture<Result<()>>> = HashMap::new();
         let mut success_count = 0;
 
         // Build loop
         loop {
-            if remaining_drv_paths.is_empty() && builds_in_progress.is_empty() && fetches_in_progress.is_empty() {
+            if remaining_drv_paths.is_empty() && builds_in_progress.is_empty() && local_builds_in_progress.is_empty() {
                 return;
             }
 
             let can_build = builds_in_progress.len() < max_jobs;
-            let can_fetch = fetches_in_progress.len() < max_fetch_jobs;
+            let can_build_local= local_builds_in_progress.len() < max_local_jobs;
 
             // We can build derications that have no dependencies
             let mut buildable_drvs: Vec<_> = remaining_drv_paths
                 .iter()
                 .copied()
                 .filter(|drv_path| {
-                    let is_source = drvs.get(drv_path).unwrap().is_source();
-                    drv_dependencies[drv_path].is_empty() && ((can_fetch && is_source) || (can_build && !is_source))
+                    let is_source = drvs[drv_path].is_local();
+                    drv_dependencies[drv_path].is_empty() && ((can_build_local && is_source) || (can_build && !is_source))
                 })
                 .cloned()
                 .collect();
@@ -310,8 +310,8 @@ fn build_drvs<'a>(
                         .boxed();
                 remaining_drv_paths.remove(&to_build);
 
-                if drvs[&to_build].is_source() {
-                    fetches_in_progress.insert(to_build, task);
+                if drvs[&to_build].is_local() {
+                    local_builds_in_progress.insert(to_build, task);
                 } else {
                     builds_in_progress.insert(to_build, task);
                 }
@@ -321,15 +321,15 @@ fn build_drvs<'a>(
             // Create a temporary stream and wait for the first completed build
             let (completed_drv_path, result) = FuturesUnordered::from_iter(
                 builds_in_progress
-                    .iter_mut().chain(fetches_in_progress.iter_mut())
+                    .iter_mut().chain(local_builds_in_progress.iter_mut())
                     .map(|(drv_path, task)| async move { (drv_path.clone(), task.await) }),
             )
             .next()
             .await
             .unwrap();
 
-            if drvs.get(&completed_drv_path).unwrap().is_source() {
-                fetches_in_progress.remove(&completed_drv_path);
+            if drvs[&completed_drv_path].is_local() {
+                local_builds_in_progress.remove(&completed_drv_path);
             } else {
                 builds_in_progress.remove(&completed_drv_path);
             }

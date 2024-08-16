@@ -132,8 +132,8 @@ impl Derivation {
         })
     }
 
-    pub fn is_source(&self) -> bool {
-        self.env.contains_key("outputHash")
+    pub fn is_local(&self) -> bool {
+        self.env.get("preferLocalBuild").map(|s| s.as_str()) == Some("1")
     }
 }
 
