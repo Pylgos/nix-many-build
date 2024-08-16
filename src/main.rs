@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use futures::future::{self, BoxFuture};
-use futures::stream::{self, select_all, BoxStream, FuturesUnordered};
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::stream::{self, FuturesUnordered};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use indicatif::{ProgressState, ProgressStyle};
 use nixapi::{check_cache_status, CacheStatus, Derivation, DrvPath, OutputName, StorePath};
 use petgraph::algo::toposort;
@@ -129,8 +129,7 @@ async fn main() -> Result<()> {
 
     let local_drvs_stream = stream::iter(drvs.values())
         .filter(|drv| async { cache_checker.clone().check_drv(drv).await == CacheStatus::Local })
-        .then(|drv| future::ready(anyhow::Ok(drv.clone())))
-        .boxed();
+        .then(|drv| future::ready(anyhow::Ok(drv.clone())));
 
     let build_stream = build_drvs(
         &graph,
@@ -145,34 +144,32 @@ async fn main() -> Result<()> {
     let build_statuses_clone = build_statuses.clone();
     let drvs_clone = drvs.clone();
     let cache_checker_clone = cache_checker.clone();
-    let built_drvs_stream = build_stream
-        .filter_map(move |(drv_path, status)| {
-            build_statuses_clone
-                .lock()
-                .unwrap()
-                .insert(drv_path.clone(), status);
-            match status {
-                BuildStatus::Success => {
-                    let drv = drvs_clone.get(&drv_path).unwrap().clone();
-                    for output in drv.outputs.values() {
-                        cache_checker_clone.mark_local(output);
-                    }
-                    future::ready(Some(anyhow::Ok(drv)))
+    let built_drvs_stream = build_stream.filter_map(move |(drv_path, status)| {
+        build_statuses_clone
+            .lock()
+            .unwrap()
+            .insert(drv_path.clone(), status);
+        match status {
+            BuildStatus::Success => {
+                let drv = drvs_clone.get(&drv_path).unwrap().clone();
+                for output in drv.outputs.values() {
+                    cache_checker_clone.mark_local(output);
                 }
-                BuildStatus::Failure => {
-                    if args.keep_going {
-                        future::ready(None)
-                    } else {
-                        error!("Aborting due to build error");
-                        future::ready(Some(Err(anyhow!("Failed to build {}", drv_path.as_str()))))
-                    }
+                future::ready(Some(anyhow::Ok(drv)))
+            }
+            BuildStatus::Failure => {
+                if args.keep_going {
+                    future::ready(None)
+                } else {
+                    error!("Aborting due to build error");
+                    future::ready(Some(Err(anyhow!("Failed to build {}", drv_path.as_str()))))
                 }
             }
-        })
-        .boxed();
+        }
+    });
 
     let cache_uploader_clone = cache_uploader.clone();
-    let result = select_all([built_drvs_stream, local_drvs_stream])
+    let result = stream::select(built_drvs_stream, local_drvs_stream)
         .map_ok(move |drv| {
             let cache_uploader = cache_uploader_clone.clone();
             let attr_by_drv = attr_by_drv.clone();
@@ -226,8 +223,8 @@ fn build_drvs<'a>(
     max_jobs: usize,
     max_local_jobs: usize,
     keep_going: bool,
-) -> BoxStream<'a, (DrvPath, BuildStatus)> {
-    async_stream::stream! {
+) -> impl Stream<Item = (DrvPath, BuildStatus)> + 'a {
+    async_fn_stream::fn_stream(move |emitter| async move {
         let mut drv_dependencies: HashMap<&DrvPath, HashSet<&DrvPath>> = graph
             .node_references()
             .map(|(node, drv_path)| {
@@ -272,12 +269,15 @@ fn build_drvs<'a>(
 
         // Build loop
         loop {
-            if remaining_drv_paths.is_empty() && builds_in_progress.is_empty() && local_builds_in_progress.is_empty() {
+            if remaining_drv_paths.is_empty()
+                && builds_in_progress.is_empty()
+                && local_builds_in_progress.is_empty()
+            {
                 return;
             }
 
             let can_build = builds_in_progress.len() < max_jobs;
-            let can_build_local= local_builds_in_progress.len() < max_local_jobs;
+            let can_build_local = local_builds_in_progress.len() < max_local_jobs;
 
             // We can build derications that have no dependencies
             let mut buildable_drvs: Vec<_> = remaining_drv_paths
@@ -285,7 +285,8 @@ fn build_drvs<'a>(
                 .copied()
                 .filter(|drv_path| {
                     let is_source = drvs[drv_path].is_local();
-                    drv_dependencies[drv_path].is_empty() && ((can_build_local && is_source) || (can_build && !is_source))
+                    drv_dependencies[drv_path].is_empty()
+                        && ((can_build_local && is_source) || (can_build && !is_source))
                 })
                 .cloned()
                 .collect();
@@ -305,9 +306,11 @@ fn build_drvs<'a>(
 
                 let to_build_clone = to_build.clone();
                 let task =
-                    tokio::spawn(async move { build_drv(&to_build_clone, out_path.as_deref()).await })
-                        .map(|result| result.unwrap())
-                        .boxed();
+                    tokio::spawn(
+                        async move { build_drv(&to_build_clone, out_path.as_deref()).await },
+                    )
+                    .map(|result| result.unwrap())
+                    .boxed();
                 remaining_drv_paths.remove(&to_build);
 
                 if drvs[&to_build].is_local() {
@@ -321,7 +324,8 @@ fn build_drvs<'a>(
             // Create a temporary stream and wait for the first completed build
             let (completed_drv_path, result) = FuturesUnordered::from_iter(
                 builds_in_progress
-                    .iter_mut().chain(local_builds_in_progress.iter_mut())
+                    .iter_mut()
+                    .chain(local_builds_in_progress.iter_mut())
                     .map(|(drv_path, task)| async move { (drv_path.clone(), task.await) }),
             )
             .next()
@@ -339,7 +343,9 @@ fn build_drvs<'a>(
                     for dependencies in drv_dependencies.values_mut() {
                         dependencies.remove(&completed_drv_path);
                     }
-                    yield (completed_drv_path, BuildStatus::Success);
+                    emitter
+                        .emit((completed_drv_path, BuildStatus::Success))
+                        .await;
                     header_span.pb_inc(1);
                     success_count += 1;
                 }
@@ -348,19 +354,22 @@ fn build_drvs<'a>(
                         warn!(name = %completed_drv_path.get_name(), drv = %completed_drv_path.as_str(), "Build failed");
                     } else {
                         error!(name = %completed_drv_path.get_name(), drv = %completed_drv_path.as_str(), "Build failed");
-                        yield (completed_drv_path, BuildStatus::Failure);
+                        emitter
+                            .emit((completed_drv_path, BuildStatus::Failure))
+                            .await;
                         return;
                     }
                     for dependant in drv_dependants_recursive[&completed_drv_path].iter() {
                         remaining_drv_paths.remove(dependant);
                     }
-                    yield (completed_drv_path, BuildStatus::Failure);
+                    emitter
+                        .emit((completed_drv_path, BuildStatus::Failure))
+                        .await;
                     header_span.pb_set_length((remaining_drv_paths.len() + success_count) as _);
                 }
             }
         }
-    }
-    .boxed()
+    })
 }
 
 async fn build_drv(drv_path: &DrvPath, out_path: Option<&Path>) -> Result<()> {

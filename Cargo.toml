@@ -5,8 +5,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.86"
+async-fn-stream = "0.2.2"
 async-recursion = "1.1.1"
-async-stream = "0.3.5"
 clap = { version = "4.5.13", features = ["derive"] }
 futures = "0.3.30"
 indicatif = "0.17.8"
