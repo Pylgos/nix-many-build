@@ -91,8 +91,7 @@ async fn main() -> Result<()> {
 
     let drvs = Arc::new(drvs);
 
-    let substituters = [Url::parse("https://cache.nixos.org")?];
-    let cache_checker = CacheStatusChecker::new(substituters.to_vec(), 16);
+    let cache_checker = CacheStatusChecker::new(args.substituters.to_vec(), 16);
     let cache_statuses = cache_checker
         .clone()
         .check_drvs(&drvs.values().cloned().collect::<Vec<_>>())
