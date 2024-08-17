@@ -100,15 +100,11 @@ async fn main() -> Result<()> {
         .check_drvs(&drvs.values().cloned().collect::<Vec<_>>())
         .await;
 
-    let not_built_drv_paths: HashSet<DrvPath> = drvs
-        .keys()
+    drvs.keys()
         .filter(|drv_path| cache_statuses[*drv_path] == CacheStatus::NotBuilt)
-        .cloned()
-        .collect();
-
-    for drv_path in not_built_drv_paths.iter() {
-        graph.remove(drv_path);
-    }
+        .for_each(|drv_path| {
+            graph.remove(drv_path);
+        });
 
     let should_available_drv_paths: Vec<&DrvPath> = drv_by_attr
         .values()
@@ -146,6 +142,8 @@ async fn main() -> Result<()> {
     let local_drvs_stream = stream::iter(drvs.values())
         .filter(|drv| async { cache_checker.clone().check_drv(drv).await == CacheStatus::Local })
         .then(|drv| future::ready(anyhow::Ok(drv.clone())));
+
+    let final_build_graph_len = graph.len();
 
     let build_stream = build_drvs(
         graph,
@@ -203,7 +201,7 @@ async fn main() -> Result<()> {
         .await;
 
     let statuses = build_statuses.lock().unwrap();
-    let total = not_built_drv_paths.len();
+    let total = final_build_graph_len;
     let built_count = statuses
         .values()
         .filter(|s| **s == BuildStatus::Success)
@@ -212,7 +210,7 @@ async fn main() -> Result<()> {
         .values()
         .filter(|s| **s == BuildStatus::Failure)
         .count();
-    let canceled_count = not_built_drv_paths.len() - built_count - failed_count;
+    let canceled_count = final_build_graph_len - built_count - failed_count;
     match result {
         Ok(_) => {
             info!(total = %total, built = %built_count, failed = %failed_count, canceled = %canceled_count, "Done");
@@ -347,6 +345,10 @@ impl DrvGraph {
             let p = self.drv_paths[dependant as usize].clone();
             self.remove(&p);
         }
+    }
+
+    fn len(&self) -> usize {
+        self.idx_by_drv_path.len()
     }
 
     fn drv_paths(&self) -> impl Iterator<Item = &DrvPath> {
