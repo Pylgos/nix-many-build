@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
         .await;
 
     drvs.keys()
-        .filter(|drv_path| cache_statuses[*drv_path] == CacheStatus::NotBuilt)
+        .filter(|drv_path| cache_statuses[*drv_path] != CacheStatus::NotBuilt)
         .for_each(|drv_path| {
             graph.remove(drv_path);
         });
