@@ -8,12 +8,9 @@ use clap::Parser;
 use futures::future::{self, BoxFuture};
 use futures::stream::{self, FuturesUnordered};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
+use fxhash::{FxHashMap, FxHashSet};
 use indicatif::{ProgressState, ProgressStyle};
 use nixapi::{check_cache_status, CacheStatus, Derivation, DrvPath, OutputName, StorePath};
-use petgraph::algo::toposort;
-use petgraph::visit::{EdgeRef as _, IntoNodeReferences};
-use petgraph::Direction::{Incoming, Outgoing};
-use petgraph::{Directed, Graph};
 use reqwest::Url;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
@@ -34,7 +31,7 @@ mod nixapi;
 struct Args {
     attr: String,
     #[arg(long)]
-    up_to: Option<String>,
+    up_to: Vec<String>,
     #[arg(long)]
     out_dir: Option<PathBuf>,
     #[arg(long, default_value = "./gc-roots")]
@@ -68,28 +65,34 @@ async fn main() -> Result<()> {
     init_logging();
     let args = Args::parse();
 
-    let mut drvs = BTreeMap::new();
     let drv_by_attr = evaluate(&args.attr, &args.gc_roots_dir).await?;
-    if let Some(up_to) = &args.up_to {
-        let up_to_drv = drv_by_attr.get(up_to).with_context(|| {
-            format!(
-                "No derivation with attribute '{}' found in flake '{}'",
-                up_to, args.attr
-            )
-        })?;
-        collect_drv_closure(&mut drvs, up_to_drv).await?;
-    } else {
-        for drv in drv_by_attr.values() {
-            collect_drv_closure(&mut drvs, drv).await?;
-        }
-    }
-    let attr_by_drv = drv_by_attr
-        .iter()
-        .map(|(attr, drv)| (drv.path.clone(), attr.clone()))
-        .collect::<HashMap<_, _>>();
-    let attr_by_drv = Arc::new(attr_by_drv);
+    let attr_by_drv = Arc::new(
+        drv_by_attr
+            .iter()
+            .map(|(attr, drv)| (drv.path.clone(), attr.clone()))
+            .collect::<HashMap<_, _>>(),
+    );
 
+    let up_to_drvs: Vec<_> = if args.up_to.is_empty() {
+        drv_by_attr.values().collect()
+    } else {
+        args.up_to
+            .iter()
+            .map(|attr| {
+                drv_by_attr
+                    .get(attr)
+                    .with_context(|| format!("attribute '{}' not found", attr))
+            })
+            .collect::<Result<_>>()?
+    };
+
+    let mut drvs = HashMap::new();
+    for drv in up_to_drvs.iter() {
+        collect_drv_closure(&mut drvs, drv).await?;
+    }
     let drvs = Arc::new(drvs);
+
+    let mut graph = DrvGraph::new(drvs.values().cloned());
 
     let cache_checker = CacheStatusChecker::new(args.substituters.to_vec(), 16);
     let cache_statuses = cache_checker
@@ -97,25 +100,39 @@ async fn main() -> Result<()> {
         .check_drvs(&drvs.values().cloned().collect::<Vec<_>>())
         .await;
 
-    let to_build: HashMap<DrvPath, Derivation> = drvs
-        .iter()
-        .filter(|(drv_path, _drv)| cache_statuses[*drv_path] == CacheStatus::NotBuilt)
-        .map(|(drv_path, drv)| (drv_path.clone(), drv.clone()))
+    let not_built_drv_paths: HashSet<DrvPath> = drvs
+        .keys()
+        .filter(|drv_path| cache_statuses[*drv_path] == CacheStatus::NotBuilt)
+        .cloned()
         .collect();
 
-    let mut graph = Graph::<DrvPath, (), Directed>::new();
-    let mut drv_nodes = BTreeMap::new();
-    for drv_path in to_build.keys() {
-        let node = graph.add_node(drv_path.clone());
-        drv_nodes.insert(drv_path, node);
+    for drv_path in not_built_drv_paths.iter() {
+        graph.remove(drv_path);
     }
-    for (drv_path, drv) in to_build.iter() {
-        let drv_node = drv_nodes.get(&drv_path).unwrap();
-        for (input, _) in &drv.inputs {
-            if let Some(input_node) = drv_nodes.get(input) {
-                graph.add_edge(*drv_node, *input_node, ());
-            }
-        }
+
+    let should_available_drv_paths: Vec<&DrvPath> = drv_by_attr
+        .values()
+        .map(|drv| &drv.path)
+        .filter(|drv_path| {
+            up_to_drvs
+                .iter()
+                .any(|drv| graph.depends_on(&drv.path, drv_path))
+        })
+        .filter(|drv_path| cache_statuses[*drv_path] == CacheStatus::NotBuilt)
+        .collect();
+
+    let not_to_build_drv_paths: Vec<DrvPath> = graph
+        .drv_paths()
+        .filter(|drv_path| {
+            should_available_drv_paths
+                .iter()
+                .all(|available_drv_path| !graph.depends_on(available_drv_path, drv_path))
+        })
+        .cloned()
+        .collect();
+
+    for drv_path in not_to_build_drv_paths {
+        graph.remove(&drv_path);
     }
 
     let cache_uploader = args.upload_command.as_ref().map(|command| {
@@ -131,9 +148,8 @@ async fn main() -> Result<()> {
         .then(|drv| future::ready(anyhow::Ok(drv.clone())));
 
     let build_stream = build_drvs(
-        &graph,
-        &drvs,
-        args.out_dir.as_deref(),
+        graph,
+        args.out_dir.clone(),
         args.max_jobs,
         args.max_local_jobs,
         args.keep_going,
@@ -187,7 +203,7 @@ async fn main() -> Result<()> {
         .await;
 
     let statuses = build_statuses.lock().unwrap();
-    let total = to_build.len();
+    let total = not_built_drv_paths.len();
     let built_count = statuses
         .values()
         .filter(|s| **s == BuildStatus::Success)
@@ -196,7 +212,7 @@ async fn main() -> Result<()> {
         .values()
         .filter(|s| **s == BuildStatus::Failure)
         .count();
-    let canceled_count = to_build.len() - built_count - failed_count;
+    let canceled_count = not_built_drv_paths.len() - built_count - failed_count;
     match result {
         Ok(_) => {
             info!(total = %total, built = %built_count, failed = %failed_count, canceled = %canceled_count, "Done");
@@ -209,53 +225,172 @@ async fn main() -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DrvGraph {
+    drv_paths: Vec<DrvPath>,
+    idx_by_drv_path: FxHashMap<DrvPath, u32>,
+    drvs: Vec<Derivation>,
+    drv_dependencies: Vec<FxHashSet<u32>>,
+    drv_dependants: Vec<FxHashSet<u32>>,
+    drv_recursive_dependencies: Vec<FxHashSet<u32>>,
+    drv_recursive_dependants: Vec<FxHashSet<u32>>,
+}
+
+impl DrvGraph {
+    fn new(drvs: impl IntoIterator<Item = Derivation>) -> Self {
+        let drvs: HashMap<DrvPath, Derivation> = drvs
+            .into_iter()
+            .map(|drv| (drv.path.clone(), drv.clone()))
+            .collect();
+        let all_drv_paths = 0..drvs.len();
+        let drv_paths: Vec<_> = drvs.keys().cloned().collect();
+        let idx_by_drv_path: FxHashMap<DrvPath, u32> = drv_paths
+            .iter()
+            .enumerate()
+            .map(|(idx, drv_path)| (drv_path.clone(), idx as u32))
+            .collect();
+        let drvs: Vec<_> = drv_paths
+            .iter()
+            .map(|drv_path| drvs[drv_path].clone())
+            .collect();
+
+        let mut drv_dependencies = vec![FxHashSet::default(); drv_paths.len()];
+        let mut drv_dependants = vec![FxHashSet::default(); drv_paths.len()];
+
+        for (drv_path, drv) in drvs.iter().enumerate() {
+            let dependencies = drv
+                .inputs
+                .iter()
+                .map(|(input, _)| idx_by_drv_path[input])
+                .collect();
+            drv_dependencies[drv_path] = dependencies;
+        }
+        for dependant_drv_path in all_drv_paths {
+            for dependency_drv_path in drv_dependencies[dependant_drv_path].iter() {
+                drv_dependants[*dependency_drv_path as usize].insert(dependant_drv_path as u32);
+            }
+        }
+
+        fn dfs(
+            drv_path: u32,
+            drv_neighbours: &Vec<FxHashSet<u32>>,
+            result: &mut Vec<FxHashSet<u32>>,
+            visited: &mut FxHashSet<u32>,
+        ) {
+            if visited.contains(&drv_path) {
+                return;
+            }
+            visited.insert(drv_path);
+            let mut rec_neighbours = FxHashSet::default();
+            for neighbour_drv_path in drv_neighbours[drv_path as usize].iter().copied() {
+                rec_neighbours.insert(neighbour_drv_path);
+                dfs(neighbour_drv_path, drv_neighbours, result, visited);
+                rec_neighbours.extend(result[neighbour_drv_path as usize].iter().cloned());
+            }
+            result[drv_path as usize] = rec_neighbours;
+        }
+
+        let mut rec_dependencies = vec![FxHashSet::default(); drv_paths.len()];
+        let mut rec_dependants = vec![FxHashSet::default(); drv_paths.len()];
+        let mut rec_dependencies_visited = FxHashSet::default();
+        let mut rec_dependants_visited = FxHashSet::default();
+        for drv_path in 0..drv_paths.len() {
+            dfs(
+                drv_path as _,
+                &drv_dependencies,
+                &mut rec_dependencies,
+                &mut rec_dependencies_visited,
+            );
+            dfs(
+                drv_path as _,
+                &drv_dependants,
+                &mut rec_dependants,
+                &mut rec_dependants_visited,
+            );
+        }
+
+        Self {
+            drv_paths,
+            idx_by_drv_path,
+            drvs,
+            drv_dependencies,
+            drv_dependants,
+            drv_recursive_dependencies: rec_dependencies,
+            drv_recursive_dependants: rec_dependants,
+        }
+    }
+
+    fn remove(&mut self, drv_path: &DrvPath) {
+        let idx = self.idx_by_drv_path[drv_path];
+        let dependants = self.drv_dependants[idx as usize].clone();
+        let dependencies = self.drv_dependencies[idx as usize].clone();
+        let rec_dependants = self.drv_recursive_dependants[idx as usize].clone();
+        let rec_dependencies = self.drv_recursive_dependencies[idx as usize].clone();
+        self.idx_by_drv_path.remove(drv_path);
+        for dependant in dependants {
+            self.drv_dependencies[dependant as usize].remove(&idx);
+        }
+        for dependency in dependencies {
+            self.drv_dependants[dependency as usize].remove(&idx);
+        }
+        for dependant in rec_dependants {
+            self.drv_recursive_dependencies[dependant as usize].remove(&idx);
+        }
+        for dependency in rec_dependencies {
+            self.drv_recursive_dependants[dependency as usize].remove(&idx);
+        }
+    }
+
+    fn remove_recursive_dependants(&mut self, drv_path: &DrvPath) {
+        let drv_path = self.idx_by_drv_path[drv_path];
+        for dependant in self.drv_recursive_dependants[drv_path as usize].clone() {
+            let p = self.drv_paths[dependant as usize].clone();
+            self.remove(&p);
+        }
+    }
+
+    fn drv_paths(&self) -> impl Iterator<Item = &DrvPath> {
+        self.idx_by_drv_path.keys()
+    }
+
+    fn drv(&self, drv_path: &DrvPath) -> &Derivation {
+        &self.drvs[self.idx_by_drv_path[drv_path] as usize]
+    }
+
+    fn has_no_dependencies(&self, drv_path: &DrvPath) -> bool {
+        self.drv_dependencies[self.idx_by_drv_path[drv_path] as usize].is_empty()
+    }
+
+    fn recursive_dependant_count(&self, drv_path: &DrvPath) -> usize {
+        self.drv_recursive_dependants[self.idx_by_drv_path[drv_path] as usize].len()
+    }
+
+    fn depends_on(&self, drv_path: &DrvPath, other_drv_path: &DrvPath) -> bool {
+        let Some(drv_path) = self.idx_by_drv_path.get(drv_path) else {
+            return false;
+        };
+        let Some(other_drv_path) = self.idx_by_drv_path.get(other_drv_path) else {
+            return false;
+        };
+        self.drv_recursive_dependencies[*drv_path as usize].contains(other_drv_path)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuildStatus {
     Success,
     Failure,
 }
 
-fn build_drvs<'a>(
-    graph: &'a Graph<DrvPath, ()>,
-    drvs: &'a BTreeMap<DrvPath, Derivation>,
-    out_dir: Option<&'a Path>,
+fn build_drvs(
+    mut graph: DrvGraph,
+    out_dir: Option<PathBuf>,
     max_jobs: usize,
     max_local_jobs: usize,
     keep_going: bool,
-) -> impl Stream<Item = (DrvPath, BuildStatus)> + 'a {
+) -> impl Stream<Item = (DrvPath, BuildStatus)> {
     async_fn_stream::fn_stream(move |emitter| async move {
-        let mut drv_dependencies: HashMap<&DrvPath, HashSet<&DrvPath>> = graph
-            .node_references()
-            .map(|(node, drv_path)| {
-                let dependencies = graph
-                    .edges_directed(node, Outgoing)
-                    .map(|edge| &graph[edge.target()])
-                    .collect();
-                (drv_path, dependencies)
-            })
-            .collect();
-        let drv_dependants: HashMap<&DrvPath, HashSet<&DrvPath>> = graph
-            .node_references()
-            .map(|(node, drv_path)| {
-                let dependencies = graph
-                    .edges_directed(node, Incoming)
-                    .map(|edge| &graph[edge.source()])
-                    .collect();
-                (drv_path, dependencies)
-            })
-            .collect();
-        let mut drv_dependants_recursive: HashMap<&DrvPath, HashSet<&DrvPath>> = HashMap::new();
-        for node in toposort(&graph, None).unwrap() {
-            let drv_path = &graph[node];
-            let mut all_dependants = HashSet::new();
-            for dependant in drv_dependants[drv_path].iter().copied() {
-                all_dependants.insert(dependant);
-                all_dependants.extend(drv_dependants_recursive[dependant].iter());
-            }
-            drv_dependants_recursive.insert(drv_path, all_dependants);
-        }
-
-        let mut remaining_drv_paths: HashSet<_> = graph.node_weights().collect();
+        let mut remaining_drv_paths: HashSet<_> = graph.drv_paths().cloned().collect();
 
         let header_span = info_span!("header");
         header_span.pb_set_style(&ProgressStyle::default_bar());
@@ -281,11 +416,10 @@ fn build_drvs<'a>(
             // We can build derications that have no dependencies
             let mut buildable_drvs: Vec<_> = remaining_drv_paths
                 .iter()
-                .copied()
                 .filter(|drv_path| {
-                    let is_source = drvs[drv_path].is_local();
-                    drv_dependencies[drv_path].is_empty()
-                        && ((can_build_local && is_source) || (can_build && !is_source))
+                    let is_local = graph.drv(drv_path).is_local();
+                    graph.has_no_dependencies(drv_path)
+                        && ((can_build_local && is_local) || (can_build && !is_local))
                 })
                 .cloned()
                 .collect();
@@ -294,11 +428,11 @@ fn build_drvs<'a>(
             if !buildable_drvs.is_empty() {
                 // Build the derivation with the most dependants first
                 buildable_drvs.sort_by_cached_key(|drv_path| {
-                    (drv_dependants_recursive[drv_path].len(), drv_path.clone())
+                    (graph.recursive_dependant_count(drv_path), drv_path.clone())
                 });
                 let to_build = buildable_drvs.last().cloned().unwrap();
                 info!(drv = %to_build.as_str(), "Building");
-                let out_path = out_dir.map(|dir| {
+                let out_path = out_dir.as_ref().map(|dir| {
                     let drv_name = to_build.file_stem().unwrap();
                     dir.join(drv_name)
                 });
@@ -312,7 +446,7 @@ fn build_drvs<'a>(
                     .boxed();
                 remaining_drv_paths.remove(&to_build);
 
-                if drvs[&to_build].is_local() {
+                if graph.drv(&to_build).is_local() {
                     local_builds_in_progress.insert(to_build, task);
                 } else {
                     builds_in_progress.insert(to_build, task);
@@ -331,7 +465,7 @@ fn build_drvs<'a>(
             .await
             .unwrap();
 
-            if drvs[&completed_drv_path].is_local() {
+            if graph.drv(&completed_drv_path).is_local() {
                 local_builds_in_progress.remove(&completed_drv_path);
             } else {
                 builds_in_progress.remove(&completed_drv_path);
@@ -339,9 +473,7 @@ fn build_drvs<'a>(
             match result {
                 Ok(_) => {
                     info!(name = %completed_drv_path.get_name(), drv = %completed_drv_path.as_str(), "Build succeeded");
-                    for dependencies in drv_dependencies.values_mut() {
-                        dependencies.remove(&completed_drv_path);
-                    }
+                    graph.remove(&completed_drv_path);
                     emitter
                         .emit((completed_drv_path, BuildStatus::Success))
                         .await;
@@ -358,9 +490,7 @@ fn build_drvs<'a>(
                             .await;
                         return;
                     }
-                    for dependant in drv_dependants_recursive[&completed_drv_path].iter() {
-                        remaining_drv_paths.remove(dependant);
-                    }
+                    graph.remove_recursive_dependants(&completed_drv_path);
                     emitter
                         .emit((completed_drv_path, BuildStatus::Failure))
                         .await;
@@ -588,7 +718,7 @@ impl CacheUploader {
 
 #[async_recursion::async_recursion]
 async fn collect_drv_closure(
-    result: &mut BTreeMap<DrvPath, Derivation>,
+    result: &mut HashMap<DrvPath, Derivation>,
     drv: &Derivation,
 ) -> Result<()> {
     if result.contains_key(&drv.path) {
