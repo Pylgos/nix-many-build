@@ -4,11 +4,12 @@ pkgs=(pkg_{a..h})
 
 cleanup() {
   for pkg in ${pkgs[@]}; do
+    echo "Cleaning up $pkg"
     local outPath
-    outPath=$(nix eval .#test.x86_64-linux.$pkg.outPath 2>/dev/null)
+    outPath=$(nix eval .#test.x86_64-linux.$pkg.outPath --json | jq -r . 2>/dev/null)
     if [[ -d $outPath ]]; then
       echo "Deleting $outPath"
-      nix store delete $outPath 
+      nix store delete "$outPath"
     fi
   done
 }
