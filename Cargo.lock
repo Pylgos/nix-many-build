@@ -597,7 +597,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nix-many-build"
+name = "nix-mass-build"
 version = "0.1.0"
 dependencies = [
  "anyhow",

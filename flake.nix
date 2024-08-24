@@ -20,7 +20,7 @@
       {
         devShells.default = pkgs.mkShell { nativeBuildInputs = [ pkgs.nix-eval-jobs ]; };
         packages.default = pkgs.rustPlatform.buildRustPackage {
-          pname = "nix-many-build";
+          pname = "nix-mass-build";
           version = "0.1.0";
           src = nix-filter.lib.filter {
             root = ./.;
@@ -33,7 +33,7 @@
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ pkgs.makeWrapper ];
           postFixup = ''
-            wrapProgram $out/bin/nix-many-build --prefix PATH : ${
+            wrapProgram $out/bin/nix-mass-build --prefix PATH : ${
               pkgs.lib.makeBinPath [
                 pkgs.nix-eval-jobs
                 pkgs.nix

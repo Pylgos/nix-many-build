@@ -1,1 +1,1 @@
-# nix-many-build
+# nix-mass-build
